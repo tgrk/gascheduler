@@ -424,10 +424,27 @@ setup_slaves(Num) ->
 
 setup_slaves(Begin, End) ->
     Slaves = [ Slave || {ok, Slave}
-                <- [ slave:start_link(localhost, "slave" ++ integer_to_list(N))
+                <- [ slave:start_link(localhost, "slave" ++ integer_to_list(N), slave_code_path())
                      || N <- lists:seq(Begin, End) ] ],
     ?assertEqual(length(Slaves), End - Begin + 1),
     Slaves.
+
+%% Code taken from https://github.com/uwiger/gproc/blob/master/test/gproc_dist_tests.erl to make rebar3 tests work
+slave_code_path() ->
+    {Pa, Pz} = build_code_paths(),
+    "-pa ./ -pz ../ebin" ++ lists:flatten([[" -pa " ++ Path || Path <- Pa], [" -pz " ++ Path || Path <- Pz]]).
+
+%% Code taken from https://github.com/uwiger/gproc/blob/master/test/gproc_dist_tests.erl to make rebar3 tests work
+build_code_paths() ->
+    Path = code:get_path(),
+    {ok, [[Root]]} = init:get_argument(root),
+    {Pas, Rest} = lists:splitwith(fun(P) ->
+                    not lists:prefix(Root, P)
+                end, Path),
+    {_, Pzs} = lists:splitwith(fun(P) ->
+                    lists:prefix(Root, P)
+                end, Rest),
+    {Pas, Pzs}.
 
 kill_slaves(Slaves) ->
     lists:foreach(fun(Slave) -> ok = slave:stop(Slave) end, Slaves).
@@ -510,7 +527,7 @@ test_tasks(Scheduler, NumTasks, Nodes) ->
             end
          end, Tasks),
 
-    {ReceivedTasks, ReceivedNodes} = lists:unzip(Received),
+    {ReceivedTasks, ReceivedNodes} = R = lists:unzip(Received),
 
     %% Ensure all tasks were completed.
     ?assertEqual(lists:usort(ReceivedTasks), Tasks),

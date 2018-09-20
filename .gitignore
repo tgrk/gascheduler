@@ -14,3 +14,5 @@ tmp/
 tags
 .deps_plt
 .rebar/
+_build/
+rebar.lock
