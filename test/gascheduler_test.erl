@@ -13,15 +13,16 @@ gascheduler_test_() ->
      fun setup/0,
      fun teardown/1,
      [
-      {spawn, {timeout, 60,  ?_test(execute_tasks())}},
-      {spawn, {timeout, 60,  ?_test(max_workers())}},
-      {spawn, {timeout, 60,  ?_test(max_retries())}},
-      {spawn, {timeout, 60,  ?_test(all_nodes_down())}},
-      {spawn, {timeout, 60,  ?_test(node_down())}},
-      {spawn, {timeout, 60,  ?_test(unfinished())}},
-      {spawn, {timeout, 60,  ?_test(permanent_failure())}},
-      {spawn, {timeout, 120, ?_test(exit_handling())}},
-      {spawn, ?_test(unnamed_scheduler())}
+        {spawn, {timeout, 60,  ?_test(execute_tasks())}},
+        {spawn, {timeout, 60,  ?_test(max_workers())}},
+        {spawn, {timeout, 60,  ?_test(max_retries())}},
+        {spawn, {timeout, 60,  ?_test(all_nodes_down())}},
+        {spawn, {timeout, 60,  ?_test(node_down())}},
+        {spawn, {timeout, 60,  ?_test(excluded_nodes())}},
+        {spawn, {timeout, 60,  ?_test(unfinished())}},
+        {spawn, {timeout, 60,  ?_test(permanent_failure())}},
+        {spawn, {timeout, 120, ?_test(exit_handling())}},
+        {spawn, ?_test(unnamed_scheduler())}
     ]}.
 
 
@@ -81,9 +82,9 @@ max_workers() ->
     ok = meck:new(gascheduler, [passthrough]),
     ok = meck:expect(gascheduler, pending_to_running,
         fun (State) ->
-            ok = check_nodes(element(7, State), Nodes, MaxWorkers),
+            ok = check_nodes(element(8, State), Nodes, MaxWorkers),
             NewState = meck:passthrough([State]),
-            ok = check_nodes(element(7, NewState), Nodes, MaxWorkers),
+            ok = check_nodes(element(8, NewState), Nodes, MaxWorkers),
             NewState
         end),
     true = meck:validate(gascheduler),
@@ -256,6 +257,66 @@ node_down() ->
 
     ok.
 
+
+
+%% Start 10 nodes
+%% Start the scheduler
+%% Run 100 tasks
+%% Verify that exluded node is not part of task workers
+excluded_nodes() ->
+    ok = net_kernel:monitor_nodes(true),
+    NumNodes = 2,
+    Slaves = setup_slaves(NumNodes - 1),
+    ExcludedNodes = [lists:last(Slaves)],
+
+    receive_nodeup(Slaves),
+    Nodes = [get_master() | lists:usort(Slaves ++ ExcludedNodes)],
+
+    MaxWorkers = 10,
+    MaxRetries = 10,
+    NumTasks = 100,
+    Client = self(),
+
+    {ok, _} = gascheduler:start_link(
+                test, Nodes, Client, MaxWorkers, MaxRetries, ExcludedNodes),
+    ok = gascheduler:set_retry_timeout(test, 0),
+
+    Tasks = lists:seq(1, NumTasks),
+    ok = lists:foreach(
+        fun(Id) ->
+            ok = gascheduler:execute(test, {gascheduler_test, sleep_100, [Id]})
+        end, Tasks),
+
+    %% try to add again an exluded node
+    ok = gascheduler:add_worker_node(test, hd(ExcludedNodes)),
+
+    {ok, CurrentExcludedNodes} = gascheduler:get_excluded_workers(test),
+    ?assertEqual(
+        lists:sort(ExcludedNodes), lists:sort(CurrentExcludedNodes)),
+
+    %% This will only succeed if we receive 100 successes.
+    lists:foreach(
+        fun(_) ->
+            receive
+                {test, {ok, _Id}, Node, {Mod, Fun, _Args}} ->
+                    ?assertNot(lists:member(Node, ExcludedNodes)),
+                    ?assertEqual(gascheduler_test, Mod),
+                    ?assertEqual(sleep_100, Fun);
+                Msg ->
+                    error_logger:error_msg("unexpected message: ~p", [Msg]),
+                    ?assert(false)
+            end
+         end, Tasks),
+
+    ?assertEqual(ok, gascheduler:set_excluded_workers(test, [])),
+    ?assertMatch({ok, []}, gascheduler:get_excluded_workers(test)),
+
+    ok = gascheduler:stop(test),
+    kill_slaves(Slaves),
+    receive_nodedown(Slaves),
+
+    ok.
+
 %% Start 3 nodes
 %% Start the scheduler
 %% Start 100 tasks that sleep and check all are unfinished
@@ -404,7 +465,7 @@ unnamed_scheduler() ->
 
 
 %%
-%% Utilities
+%% Utilitiesfg
 %%
 
 get_master() ->
@@ -424,10 +485,27 @@ setup_slaves(Num) ->
 
 setup_slaves(Begin, End) ->
     Slaves = [ Slave || {ok, Slave}
-                <- [ slave:start_link(localhost, "slave" ++ integer_to_list(N))
+                <- [ slave:start_link(localhost, "slave" ++ integer_to_list(N), slave_code_path())
                      || N <- lists:seq(Begin, End) ] ],
     ?assertEqual(length(Slaves), End - Begin + 1),
     Slaves.
+
+%% Code taken from https://github.com/uwiger/gproc/blob/master/test/gproc_dist_tests.erl to make rebar3 tests work
+slave_code_path() ->
+    {Pa, Pz} = build_code_paths(),
+    "-pa ./ -pz ../ebin" ++ lists:flatten([[" -pa " ++ Path || Path <- Pa], [" -pz " ++ Path || Path <- Pz]]).
+
+%% Code taken from https://github.com/uwiger/gproc/blob/master/test/gproc_dist_tests.erl to make rebar3 tests work
+build_code_paths() ->
+    Path = code:get_path(),
+    {ok, [[Root]]} = init:get_argument(root),
+    {Pas, Rest} = lists:splitwith(fun(P) ->
+                    not lists:prefix(Root, P)
+                end, Path),
+    {_, Pzs} = lists:splitwith(fun(P) ->
+                    lists:prefix(Root, P)
+                end, Rest),
+    {Pas, Pzs}.
 
 kill_slaves(Slaves) ->
     lists:foreach(fun(Slave) -> ok = slave:stop(Slave) end, Slaves).
@@ -523,9 +601,9 @@ test_tasks(Scheduler, NumTasks, Nodes) ->
 %% Sort nodes according to the number of workers they have, in ascending order
 sort_nodes(Running, Nodes) ->
     AccFun = fun ({Pid, _MFA}, Acc) ->
-                 Node = node(Pid),
-                 Sum = proplists:get_value(Node, Acc, 0),
-                 lists:keystore(Node, 1, Acc, {Node, Sum+1})
+                    Node = node(Pid),
+                    Sum = proplists:get_value(Node, Acc, 0),
+                    lists:keystore(Node, 1, Acc, {Node, Sum+1})
              end,
     Acc = lists:map(fun (Node) -> {Node, 0} end, Nodes),
     NodeCount = lists:foldl(AccFun, Acc, Running),

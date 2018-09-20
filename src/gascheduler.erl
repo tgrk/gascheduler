@@ -6,6 +6,7 @@
 
 %% API
 -export([start_link/5,
+         start_link/6,
          start_link/4,
          stop/1,
          execute/2,
@@ -14,7 +15,9 @@
          unfinished/1,
          set_retry_timeout/2,
          set_max_workers/2,
-         get_max_workers/1
+         get_max_workers/1,
+         set_excluded_workers/2,
+         get_excluded_workers/1
         ]).
 
 %% For workers
@@ -51,6 +54,9 @@
 -record(state, {%% a set of all nodes that can run workers
                 nodes :: worker_nodes(),
 
+                %% a set of nodes that are to be excluded from available workers
+                excluded_nodes :: worker_nodes(),
+
                 %% maximum workers on an individual node
                 max_workers :: max_workers(),
 
@@ -80,13 +86,20 @@
           -> {ok, pid()}.
 start_link(Name, Nodes, Client, MaxWorkers, MaxRetries) ->
     gen_server:start_link({local, Name}, ?MODULE,
-                           [Nodes, Client, MaxWorkers, MaxRetries], []).
+                           [Nodes, Client, MaxWorkers, MaxRetries, []], []).
+
+
+-spec start_link(atom(), worker_nodes(), client(), max_workers(), max_retries(), worker_nodes())
+                -> {ok, pid()}.
+start_link(Name, Nodes, Client, MaxWorkers, MaxRetries, ExcludedNodes) ->
+    gen_server:start_link({local, Name}, ?MODULE,
+                        [Nodes, Client, MaxWorkers, MaxRetries, ExcludedNodes], []).
 
 -spec start_link(worker_nodes(), client(), max_workers(), max_retries())
           -> {ok, pid()}.
 start_link(Nodes, Client, MaxWorkers, MaxRetries) ->
     gen_server:start_link(?MODULE,
-                           [Nodes, Client, MaxWorkers, MaxRetries], []).
+                           [Nodes, Client, MaxWorkers, MaxRetries, []], []).
 
 -spec stop(atom()) -> ok.
 stop(Name) ->
@@ -124,6 +137,14 @@ set_max_workers(Name, Workers) ->
 get_max_workers(Name) ->
     gen_server:call(Name, get_max_workers).
 
+-spec set_excluded_workers(atom(), worker_nodes()) -> ok.
+set_excluded_workers(Name, WorkerNodes) ->
+    gen_server:call(Name, {set_excluded_workers, WorkerNodes}).
+
+-spec get_excluded_workers(atom()) -> {ok, worker_nodes()}.
+get_excluded_workers(Name) ->
+    gen_server:call(Name, get_excluded_workers).
+
 %%% For workers
 
 -spec notify_client(pid(), result(), pid(), mfa()) -> ok.
@@ -133,22 +154,26 @@ notify_client(Scheduler, Result, Worker, MFA) ->
 
 %%% gen_server callbacks
 
-init([Nodes, Client, MaxWorkers, MaxRetries]) ->
+init([Nodes, Client, MaxWorkers, MaxRetries, ExcludedNodes]) ->
     process_flag(trap_exit, true),
     ok = net_kernel:monitor_nodes(true),
 
-    case ping_nodes(Nodes) of
+    InitState = #state{ nodes          = Nodes,
+                        excluded_nodes = ExcludedNodes,
+                        client         = Client,
+                        max_workers    = MaxWorkers,
+                        max_retries    = MaxRetries,
+                        retry_timeout  = 1000,
+                        pending        = queue:new(),
+                        running        = [],
+                        ticks          = 0
+                },
+
+    case ping_nodes(Nodes, ExcludedNodes) of
         [] ->
             erlang:error(no_nodes_in_cluster);
-        Nodes ->
-            {ok, #state{nodes         = Nodes,
-                        client        = Client,
-                        max_workers   = MaxWorkers,
-                        max_retries   = MaxRetries,
-                        retry_timeout = 1000,
-                        pending       = queue:new(),
-                        running       = [],
-                        ticks         = 0}}
+        EligibleNodes ->
+            {ok, InitState#state{nodes = EligibleNodes}}
     end.
 
 handle_call({execute, MFA}, _From, State) ->
@@ -157,9 +182,9 @@ handle_call({execute, MFA}, _From, State) ->
 handle_call({add_worker_node, Node}, _From, State = #state{nodes = Nodes}) ->
     {Reply, NewNodes} = case net_adm:ping(Node) of
                             pong ->
-                                case lists:member(Node, Nodes) of
-                                    true -> {ok, Nodes};
-                                    false -> {ok, [Node | Nodes]}
+                                case is_eligible_node(Node, State) of
+                                    false -> {ok, Nodes};
+                                    true -> {ok, [Node | Nodes]}
                                 end;
                             _    -> {node_not_found, Nodes}
                         end,
@@ -201,6 +226,13 @@ handle_call({set_max_workers, Workers}, _From, State) ->
 
 handle_call(get_max_workers, _From, State) ->
     {reply, {ok, State#state.max_workers}, State};
+
+
+handle_call({set_excluded_workers, WorkerNodes}, _From, State) ->
+    {reply, ok, State#state{excluded_nodes = WorkerNodes}};
+
+handle_call(get_excluded_workers, _From, State) ->
+    {reply, {ok, State#state.excluded_nodes}, State};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -266,9 +298,9 @@ handle_info({nodedown, NodeDown}, State = #state{nodes = Nodes}) ->
     %% in the running queue but no nodes in the nodes list.
     {noreply, State#state{nodes = lists:delete(NodeDown, Nodes)}};
 handle_info({nodeup, Node}, State = #state{nodes = Nodes}) ->
-    NewNodes = case lists:member(Node, Nodes) of
-                   true -> Nodes;
-                   false -> [Node | Nodes]
+    NewNodes = case is_eligible_node(Node, State) of
+                   false -> Nodes;
+                   true -> [Node | Nodes]
                end,
     error_logger:warning_msg("gascheduler: adding node ~p back to scheduler",
                              [Node]),
@@ -336,14 +368,12 @@ sort_nodes(Running, Nodes) ->
     lists:keysort(2, orddict:to_list(NodeCount)).
 
 
--spec ping_nodes([node()]) -> [node()] | [].
-ping_nodes(Nodes) ->
-    lists:filter(fun(Node) when Node =:= node() -> true;
+-spec ping_nodes(worker_nodes(), worker_nodes()) -> [node()] | [].
+ping_nodes(Nodes, ExcludedNodes) ->
+    lists:filter(fun(Node) when Node =:= node() ->
+                        true;
                     (Node) ->
-                     case net_adm:ping(Node) of
-                         pong -> true;
-                         _    -> false
-                     end
+                        net_adm:ping(Node) == pong andalso not lists:member(Node, ExcludedNodes)
                  end,
                  Nodes).
 
@@ -445,3 +475,12 @@ pending_to_running(State = #state{pending = Pending,
 remove_worker(Worker, Running) ->
     ok = gen_server:cast(self(), tick),
     lists:keydelete(Worker, 1, Running).
+
+%% Add node only if it is not already added or is excluded
+is_eligible_node(Node, #state{nodes = Nodes, excluded_nodes = Excluded}) ->
+    case lists:member(Node, Nodes) of
+        true ->
+            false;
+        false ->
+            not lists:member(Node, Excluded)
+    end.
